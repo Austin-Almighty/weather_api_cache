@@ -1,12 +1,21 @@
+import logging
 from typing import Annotated
+from urllib.parse import quote
 
 import httpx
-from fastapi import APIRouter, Depends, Path, status
+from fastapi import APIRouter, Depends, HTTPException, Path, status
+from httpx import Response
+from pydantic import ValidationError
 
 from config import Settings, get_settings
-from validation.date_string import DateSpec
+from models.json_to_structured_response import (
+    ResponseShape,
+    json_to_structured_response,
+)
 
-router = APIRouter(tags=["location"])
+router = APIRouter(tags=["location"], prefix="/weather")
+
+logger = logging.getLogger(__name__)
 
 Location = Annotated[
     str,
@@ -18,42 +27,67 @@ Location = Annotated[
 ]
 
 Date = Annotated[str | None, Path()]
-
 EnvSettings = Annotated[Settings, Depends(get_settings)]
 
 
 @router.get("/{location}", status_code=status.HTTP_200_OK)
 async def get_current_weather_with_location(
     location: Location, env_settings: EnvSettings
-):
-    async with httpx.AsyncClient() as client:
-        response = await client.get(
-            env_settings.api_base_url,
-            params={
-                "location": location,
-                "key": env_settings.weather_api_key.get_secret_value(),
-            },
-        )
-    response.raise_for_status()
+) -> ResponseShape:
+    async with httpx.AsyncClient(
+        timeout=httpx.Timeout(env_settings.api_timeout_seconds)
+    ) as client:
+        try:
+            response: Response = await client.get(
+                f"{env_settings.api_base_url}/{quote(location)}/next2days",
+                params={
+                    "key": env_settings.weather_api_key.get_secret_value(),
+                    "unitGroup": "metric",
+                    "include": "days,current",
+                },
+            )
+        except httpx.TimeoutException:
+            logger.warning("Visual Crossing timed out for %s", location)
+            raise HTTPException(
+                status_code=504, detail="Weather provider took too long to respond"
+            ) from None
+        except httpx.ConnectError:
+            logger.warning("Connection to Visual Crossing API failed")
+            raise HTTPException(
+                status_code=status.HTTP_502_BAD_GATEWAY,
+                detail="Connection to API failed",
+            ) from None
+    try:
+        response.raise_for_status()
+        logger.info("Fetched weather for %s: status %s", location, response.status_code)
+    except httpx.HTTPStatusError as exc:
+        if (
+            exc.response.status_code == 400
+            and "No valid locations" in exc.response.text
+        ):
+            logger.info(
+                "Failed to find the data for %s: status %s",
+                location,
+                exc.response.status_code,
+            )
+            raise HTTPException(
+                status_code=status.HTTP_404_NOT_FOUND,
+                detail="The system cannot find the location you entered",
+            ) from None
+        else:
+            logger.warning(
+                "Visual Crossing returned %s",
+                exc.response.status_code,
+            )
+            raise HTTPException(status_code=status.HTTP_502_BAD_GATEWAY) from None
 
-    return response.json()
-    # location="vancouver"
-    # token = os.environ.get("weather_api")
-    # today = datetime.now(UTC)
-    # tomorrow = today + timedelta(days=1)
-    # today = today.strftime("%Y-%m-%d")
-    # tomorrow = tomorrow.strftime("%Y-%m-%d")
-
-    # request_url = f"{base_url}{location}/{today}/{tomorrow}" if location else base_url
-
-    # response = httpx.get(request_url, params={"key":token, "include":"days"})
-
-    # print(response.status_code)
-    # print(response.json())
-
-
-@router.get("/{location}/{date1}", status_code=status.HTTP_200_OK)
-async def get_weather_with_location_and_date(location: Location, date1: DateSpec):
-    # async with httpx.AsyncClient() as client:
-    #     pass
-    pass
+    data = response.json()
+    try:
+        res = json_to_structured_response(data)
+    except ValidationError:
+        logger.exception("Data validation failed")
+        raise HTTPException(
+            status_code=status.HTTP_502_BAD_GATEWAY,
+            detail="Weather provider returned incomplete data",
+        ) from None
+    return res

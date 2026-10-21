@@ -9,6 +9,8 @@ wheels/
 
 .vibe-wise
 .ruff_cache
+.tests
+.vscode
 
 # Virtual environments
 .venv

@@ -12,9 +12,10 @@ class Settings(BaseSettings):
     model_config = SettingsConfigDict(env_file=BASE_DIR / ".env", env_ignore_empty=True)
 
     weather_api_key: Annotated[SecretStr, Field(min_length=1)]
-    api_base_url: str = "https://weather.visualcrossing.com/VisualCrossingWebServices/rest/services/timeline/"
+    api_base_url: str = "https://weather.visualcrossing.com/VisualCrossingWebServices/rest/services/timeline"
     redis_url: str = "redis://127.0.0.1:6379/0"
     cache_ttl_seconds: Annotated[int, Field(ge=1)] = 43200
+    api_timeout_seconds: Annotated[float, Field(gt=0)] = 3.0
 
 
 @lru_cache
