@@ -109,7 +109,7 @@ Status as of 2026-10-21. Items marked *(partial)* are started but not finished.
     - Route takes `client: HttpClient`; the per-request `async with httpx.AsyncClient(...)` is gone, the `try`/`except` around `client.get(...)` stays
     - Verified: ruff + Pyrefly (warnings shown) clean; same client across requests, closed after shutdown; mocked via `dependency_overrides`: good `200`, timeout `504`, connect error `502`, 400 no-location `404`, 401 `502`, bad data `502`
   - [ ] **Redis client**: `redis.asyncio.from_url(settings.redis_url, decode_responses=True)` as a second key in the same dict; `async with` closes it at shutdown (no separate `aclose()` needed); a second dependency function (`-> Redis`) + alias in `dependencies.py`
-  - [ ] **`State` TypedDict** (decided 2026-10-21) in `dependencies.py`, replacing `dict[str, httpx.AsyncClient]` in the lifespan's return type
+  - [x] **`State` TypedDict** (done 2026-10-21) in `dependencies.py`, replacing `dict[str, httpx.AsyncClient]` in the lifespan's return type — verified: a misspelled key or a wrong value type in the `yield` is now a Pyrefly error. Add the Redis key here when the Redis client comes in
     - Lifespan return type: `-> AsyncGenerator[State]` — **not** `AsyncIterator[...]`, which Pyrefly flags as deprecated with `@asynccontextmanager`
     - Only for the type checker: Pyrefly catches a misspelled key or wrong value type in the `yield`, but **not** in `request.state.<name>` reads — those names must match `State` by hand
     - A dict is required: Starlette merges it with `scope["state"].update(...)`; yielding a bare client fails at startup (`TypeError: 'AsyncClient' object is not iterable`)
@@ -176,4 +176,4 @@ Goal: protect the Visual Crossing quota and keep one caller from using more than
 
 ---
 
-**Suggested order** (updated 2026-10-21): §4 done → error handling (6) done → **Redis caching (5) in progress** (shared clients: httpx done, `State` + Redis client next → cache key → check/fetch/validate/save flow → refetch-once on a bad cache hit → Redis-down behavior) → rate limiting (7) → tests (8) → before finishing (9).
+**Suggested order** (updated 2026-10-21): §4 done → error handling (6) done → **Redis caching (5) in progress** (shared clients: httpx + `State` done, Redis client next → cache key → check/fetch/validate/save flow → refetch-once on a bad cache hit → Redis-down behavior) → rate limiting (7) → tests (8) → before finishing (9).
