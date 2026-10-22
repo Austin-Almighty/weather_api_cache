@@ -8,6 +8,7 @@ from httpx import Response
 from pydantic import ValidationError
 
 from config import Settings, get_settings
+from dependencies import HttpClient
 from models.json_to_structured_response import (
     ResponseShape,
     json_to_structured_response,
@@ -32,31 +33,28 @@ EnvSettings = Annotated[Settings, Depends(get_settings)]
 
 @router.get("/{location}", status_code=status.HTTP_200_OK)
 async def get_current_weather_with_location(
-    location: Location, env_settings: EnvSettings
+    location: Location, env_settings: EnvSettings, client: HttpClient
 ) -> ResponseShape:
-    async with httpx.AsyncClient(
-        timeout=httpx.Timeout(env_settings.api_timeout_seconds)
-    ) as client:
-        try:
-            response: Response = await client.get(
-                f"{env_settings.api_base_url}/{quote(location)}/next2days",
-                params={
-                    "key": env_settings.weather_api_key.get_secret_value(),
-                    "unitGroup": "metric",
-                    "include": "days,current",
-                },
-            )
-        except httpx.TimeoutException:
-            logger.warning("Visual Crossing timed out for %s", location)
-            raise HTTPException(
-                status_code=504, detail="Weather provider took too long to respond"
-            ) from None
-        except httpx.ConnectError:
-            logger.warning("Connection to Visual Crossing API failed")
-            raise HTTPException(
-                status_code=status.HTTP_502_BAD_GATEWAY,
-                detail="Connection to API failed",
-            ) from None
+    try:
+        response: Response = await client.get(
+            f"{env_settings.api_base_url}/{quote(location)}/next2days",
+            params={
+                "key": env_settings.weather_api_key.get_secret_value(),
+                "unitGroup": "metric",
+                "include": "days,current",
+            },
+        )
+    except httpx.TimeoutException:
+        logger.warning("Visual Crossing timed out for %s", location)
+        raise HTTPException(
+            status_code=504, detail="Weather provider took too long to respond"
+        ) from None
+    except httpx.ConnectError:
+        logger.warning("Connection to Visual Crossing API failed")
+        raise HTTPException(
+            status_code=status.HTTP_502_BAD_GATEWAY,
+            detail="Connection to API failed",
+        ) from None
     try:
         response.raise_for_status()
         logger.info("Fetched weather for %s: status %s", location, response.status_code)

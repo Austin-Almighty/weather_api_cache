@@ -10,7 +10,7 @@ Client ⇄ Weather API ──1. check cache──▶ Redis
                      ◀─4. response───
 ```
 
-Status as of 2026-10-20. Items marked *(partial)* are started but not finished.
+Status as of 2026-10-21. Items marked *(partial)* are started but not finished.
 
 ## 1. Project setup
 
@@ -91,15 +91,32 @@ Status as of 2026-10-20. Items marked *(partial)* are started but not finished.
 - [ ] **Step 1:** check the cache before calling the 3rd-party API
 - [ ] **Step 2:** on a cache hit, return the cached data right away
 - [ ] **Step 5:** on a cache miss, save the API response with `SET key value EX <ttl>`
-- [ ] Design the cache key (the tip suggests the city code). Think about:
-  - Normalization: should `Vancouver` and ` vancouver ` hit the same key?
+- [x] Design the cache key (decided 2026-10-20): `weather:` + the location **trimmed, lowercased, and with repeated spaces collapsed**, e.g. ` Vancouver ` → `weather:vancouver`
+  - Not `resolvedAddress`: it's only known **after** the upstream call, but the key is needed before it to check the cache
+  - Suggestions (not decided): `" ".join(s.split())` for trimming + collapsing, `casefold()` instead of `lower()`, a small `build_cache_key(location: str) -> str` function (easy to test), optionally a version or request variant in the key (e.g. `weather:v1:...`) so a change to the request params doesn't read old entries
+  - [ ] Write it
 - [ ] Serialize the data to store it (JSON string) and deserialize it on read
 - [x] Decided: cache the **raw** Visual Crossing response and build the custom shape on every read — the shape can change without stale cache entries
 - [ ] Cache-miss order (decided 2026-10-19): fetch → build the shape (validate) → **only on success** save the raw response → return the shape. On a `ValidationError`, nothing is cached
 - [ ] Cache hit that fails validation (e.g. the models changed after the entry was saved) → delete that cache entry and refetch (decided 2026-10-19)
   - Refetch only **once**: if the fresh response also fails, return the error (§6) instead of trying again
 - [ ] Decide what happens if Redis is down: return an error, or skip the cache and call the API directly?
-- [ ] Shared `redis.asyncio` client + shared `httpx.AsyncClient`, created in the `lifespan` and closed with `aclose()`
+- [ ] *(partial)* Shared `redis.asyncio` client + shared `httpx.AsyncClient`, created in the `lifespan` **(do before the cache flow)**
+  - Decided 2026-10-20 → **lifespan state**: `async with` both clients in the `lifespan`, then `yield {"http_client": ..., "redis": ...}`; read back as `request.state.<name>`. FastAPI's docs don't prescribe a pattern (they only show a module-level dict); this is Starlette's documented pattern, checked working on FastAPI 0.141.1
+  - [x] **httpx client** (done 2026-10-21)
+    - `main.py`: `async with httpx.AsyncClient(timeout=settings.api_timeout_seconds) as client:` with `yield {"http_client": client}` **inside** the block — a `yield` after the block would close the client before any request
+    - `dependencies.py`: `get_httpx_client(request: Request) -> httpx.AsyncClient` only **reads** `request.state.http_client` (no `async with` — a `return` inside one hands back a closed client); alias `HttpClient = Annotated[httpx.AsyncClient, Depends(get_httpx_client)]`
+    - Route takes `client: HttpClient`; the per-request `async with httpx.AsyncClient(...)` is gone, the `try`/`except` around `client.get(...)` stays
+    - Verified: ruff + Pyrefly (warnings shown) clean; same client across requests, closed after shutdown; mocked via `dependency_overrides`: good `200`, timeout `504`, connect error `502`, 400 no-location `404`, 401 `502`, bad data `502`
+  - [ ] **Redis client**: `redis.asyncio.from_url(settings.redis_url, decode_responses=True)` as a second key in the same dict; `async with` closes it at shutdown (no separate `aclose()` needed); a second dependency function (`-> Redis`) + alias in `dependencies.py`
+  - [ ] **`State` TypedDict** (decided 2026-10-21) in `dependencies.py`, replacing `dict[str, httpx.AsyncClient]` in the lifespan's return type
+    - Lifespan return type: `-> AsyncGenerator[State]` — **not** `AsyncIterator[...]`, which Pyrefly flags as deprecated with `@asynccontextmanager`
+    - Only for the type checker: Pyrefly catches a misspelled key or wrong value type in the `yield`, but **not** in `request.state.<name>` reads — those names must match `State` by hand
+    - A dict is required: Starlette merges it with `scope["state"].update(...)`; yielding a bare client fails at startup (`TypeError: 'AsyncClient' object is not iterable`)
+  - One dependency function per client: takes `request: Request`, returns `request.state.<name>` with a return type — `request.state` is untyped, so Pyrefly needs it. Aliases in PascalCase, like `EnvSettings`
+  - The app now needs Redis **running at startup** — ties into the Redis-down decision above
+  - Facts (checked 2026-10-20, httpx 0.28.1): one `AsyncClient` handles many requests at once through a connection pool (defaults: `max_connections=100`, `max_keepalive_connections=20`); reusing connections saves a TCP + TLS handshake per request. A full pool raises `httpx.PoolTimeout`, a subclass of `TimeoutException`, so the existing `504` branch already catches it. `redis.asyncio` pools connections the same way
+  - How it runs: each server process imports `main.py` once and runs the `lifespan` once, so there's **one client per process**, not per request. Each request is just a call to the route function; dependency functions run again on every request
 - [ ] *(Nice to have)* Show whether the data came from the cache, e.g. an `X-Cache: HIT/MISS` header
 
 ## 6. Error handling
@@ -136,12 +153,15 @@ Goal: protect the Visual Crossing quota and keep one caller from using more than
 - [ ] Open: should cache hits count toward the per-IP limit?
 - [ ] Refuse requests over a limit with `429 Too Many Requests` (optionally a `Retry-After` header)
 - [ ] Research when you get here: `slowapi`, or build it yourself with Redis (`INCR` + `EXPIRE`)
+- Keep the counters in **Redis**, not in Python memory: with `--workers N` each process has its own memory, so in-memory counters would let through N× the limit
 
 ## 8. Testing and polish
 
 - [ ] Tests with pytest (already in dev dependencies) — mock the 3rd-party API so the tests don’t use up your quota (no `tests/` folder yet)
 - [ ] Tests that run the lifespan (`with TestClient(app)`) need `monkeypatch.setenv("WEATHER_API_KEY", ...)` + `get_settings.cache_clear()` — overrides don’t apply to the lifespan
 - [ ] Test a cache hit and a cache miss
+- [ ] Mock the clients with `app.dependency_overrides[get_httpx_client] = ...` (e.g. an `httpx.AsyncClient` with `httpx.MockTransport`) — checked working 2026-10-21. The old scratchpad scripts patch `httpx.AsyncClient` directly and no longer apply
+  - Gotcha: the override function must have **no parameters** FastAPI would fill in — `lambda m=mock: m` makes `m` a query parameter and every request returns `500`
 - [ ] Test the error paths — the 9 mocked cases in the scratchpad check (`check_errors.py`) are a good starting list: good, timeout, connect error, 400 no-location, 400 other, 401, 429, 500, 200 bad data
 - [ ] Remove dead code: the unused `Date` alias in `routes/location.py`, and `validation/` (`DateSpec`) now that route 2 is gone
 - [ ] Run `uvx ruff format .` (2 files would be reformatted as of 2026-10-20)
@@ -156,4 +176,4 @@ Goal: protect the Visual Crossing quota and keep one caller from using more than
 
 ---
 
-**Suggested order** (updated 2026-10-20): §4 done → error handling (6) done → **Redis caching (5) next** → rate limiting (7) → tests (8) → before finishing (9).
+**Suggested order** (updated 2026-10-21): §4 done → error handling (6) done → **Redis caching (5) in progress** (shared clients: httpx done, `State` + Redis client next → cache key → check/fetch/validate/save flow → refetch-once on a bad cache hit → Redis-down behavior) → rate limiting (7) → tests (8) → before finishing (9).
